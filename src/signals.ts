@@ -5,16 +5,8 @@ import {
   compute,
   EagerComputation,
   Effect,
-  ERROR_BIT,
-  flatten,
-  getClock,
-  incrementClock,
-  LOADING_BIT,
   NotReadyError,
-  onCleanup,
   Owner,
-  UNCHANGED,
-  UNINITIALIZED_BIT,
   untrack
 } from "./core/index.js";
 
@@ -158,85 +150,6 @@ export function createMemo<Next extends Prev, Init, Prev>(
 }
 
 /**
- * Creates a readonly derived async reactive memoized signal
- * ```typescript
- * export function createAsync<T>(
- *   compute: (v: T) => Promise<T> | T,
- *   value?: T,
- *   options?: { name?: string, equals?: false | ((prev: T, next: T) => boolean) }
- * ): () => T;
- * ```
- * @param compute a function that receives its previous or the initial value, if set, and returns a new value used to react on a computation
- * @param value an optional initial value for the computation; if set, fn will never receive undefined as first argument
- * @param options allows to set a name in dev mode for debugging purposes and use a custom comparison function in equals
- *
- * @description https://docs.solidjs.com/reference/basic-reactivity/create-async
- */
-export function createAsync<T>(
-  compute: (prev?: T) => Promise<T> | AsyncIterable<T> | T,
-  value?: T,
-  options?: MemoOptions<T>
-): Accessor<T> {
-  let uninitialized = value === undefined;
-  const lhs = new EagerComputation(
-    {
-      _value: value
-    } as any,
-    (p?: Computation<T>) => {
-      const value = p?._value;
-      const source = compute(value);
-      const isPromise = source instanceof Promise;
-      const iterator = source[Symbol.asyncIterator];
-      if (!isPromise && !iterator) {
-        return {
-          wait() {
-            return source as T;
-          },
-          _value: source as T
-        };
-      }
-      const signal = new Computation(value, null, options);
-      const w = signal.wait;
-      signal.wait = function () {
-        if (signal._stateFlags & ERROR_BIT && signal._time <= getClock()) {
-          lhs._notify(STATE_DIRTY);
-          throw new NotReadyError();
-        }
-        return w.call(this);
-      };
-      signal.write(UNCHANGED, LOADING_BIT | (uninitialized ? UNINITIALIZED_BIT : 0));
-      if (isPromise) {
-        source.then(
-          value => {
-            uninitialized = false;
-            signal.write(value, 0, true);
-          },
-          error => {
-            uninitialized = true;
-            signal._setError(error);
-          }
-        );
-      } else {
-        let abort = false;
-        onCleanup(() => (abort = true));
-        (async () => {
-          try {
-            for await (let value of source as AsyncIterable<T>) {
-              if (abort) return;
-              signal.write(value, 0, true);
-            }
-          } catch (error: any) {
-            signal.write(error, ERROR_BIT);
-          }
-        })();
-      }
-      return signal;
-    }
-  );
-  return () => lhs.wait().wait();
-}
-
-/**
  * Creates a reactive effect that runs after the render phase
  * ```typescript
  * export function createEffect<T>(
@@ -283,45 +196,6 @@ export function createEffect<Next, Init>(
 }
 
 /**
- * Creates a reactive computation that runs during the render phase as DOM elements are created and updated but not necessarily connected
- * ```typescript
- * export function createRenderEffect<T>(
- *   compute: (prev: T) => T,
- *   effect: (v: T, prev: T) => (() => void) | void,
- *   value?: T,
- *   options?: { name?: string }
- * ): void;
- * ```
- * @param compute a function that receives its previous or the initial value, if set, and returns a new value used to react on a computation
- * @param effect a function that receives the new value and is used to perform side effects
- * @param value an optional initial value for the computation; if set, fn will never receive undefined as first argument
- * @param options allows to set a name in dev mode for debugging purposes
- *
- * @description https://docs.solidjs.com/reference/secondary-primitives/create-render-effect
- */
-export function createRenderEffect<Next>(
-  compute: ComputeFunction<undefined | NoInfer<Next>, Next>,
-  effect: EffectFunction<NoInfer<Next>, Next>
-): void;
-export function createRenderEffect<Next, Init = Next>(
-  compute: ComputeFunction<Init | Next, Next>,
-  effect: EffectFunction<Next, Next>,
-  value: Init,
-  options?: EffectOptions
-): void;
-export function createRenderEffect<Next, Init>(
-  compute: ComputeFunction<Init | Next, Next>,
-  effect: EffectFunction<Next, Next>,
-  value?: Init,
-  options?: EffectOptions
-): void {
-  void new Effect(value as any, compute as any, effect, undefined, {
-    render: true,
-    ...(__DEV__ ? { ...options, name: options?.name ?? "effect" } : options)
-  });
-}
-
-/**
  * Creates a new non-tracked reactive context with manual disposal
  *
  * @param fn a function in which the reactive state is scoped
@@ -342,83 +216,4 @@ export function createRoot<T>(init: ((dispose: () => void) => T) | (() => T)): T
  */
 export function runWithOwner<T>(owner: Owner | null, run: () => T): T {
   return compute(owner, run, null);
-}
-
-/**
- * Switches to fallback whenever an error is thrown within the context of the child scopes
- * @param fn boundary for the error
- * @param fallback an error handler that receives the error
- *
- * * If the error is thrown again inside the error handler, it will trigger the next available parent handler
- *
- * @description https://docs.solidjs.com/reference/reactive-utilities/catch-error
- */
-export function createErrorBoundary<T, U>(
-  fn: () => T,
-  fallback: (error: unknown, reset: () => void) => U
-): Accessor<T | U> {
-  const owner = new Owner();
-  const error = new Computation<{ _error: any } | undefined>(undefined, null);
-  const nodes = new Set<Owner>();
-  function handler(err: unknown, node: Owner) {
-    if (nodes.has(node)) return;
-    compute(
-      node,
-      () =>
-        onCleanup(() => {
-          nodes.delete(node);
-          if (!nodes.size) error.write(undefined);
-        }),
-      null
-    );
-    nodes.add(node);
-    if (nodes.size === 1) error.write({ _error: err });
-  }
-  owner._handlers = owner._handlers ? [handler, ...owner._handlers] : [handler];
-  const guarded = compute(
-    owner,
-    () => {
-      const c = new Computation(undefined, fn);
-      const f = new EagerComputation(undefined, () => flatten(c.read()), { defer: true });
-      f._setError = function (error) {
-        this.handleError(error);
-      };
-      return f;
-    },
-    null
-  );
-  const decision = new Computation(null, () => {
-    if (!error.read()) {
-      const resolved = guarded.read();
-      if (!error.read()) return resolved;
-    }
-    return fallback(error.read()!._error, () => {
-      incrementClock();
-      for (let node of nodes) {
-        (node as any)._state = STATE_DIRTY;
-        (node as any)._queue?.enqueue((node as any)._type, node);
-      }
-    });
-  });
-  return decision.read.bind(decision);
-}
-
-/**
- * Returns a promise of the resolved value of a reactive expression
- * @param fn a reactive expression to resolve
- */
-export function resolve<T>(fn: () => T): Promise<T> {
-  return new Promise((res, rej) => {
-    createRoot(dispose => {
-      new EagerComputation(undefined, () => {
-        try {
-          res(fn());
-        } catch (err) {
-          if (err instanceof NotReadyError) throw err;
-          rej(err);
-        }
-        dispose();
-      });
-    });
-  });
 }
